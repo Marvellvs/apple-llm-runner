@@ -11,7 +11,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 from uuid import uuid4
 
 import uvicorn
@@ -21,6 +21,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .config import Settings, SettingsError
+from .monitoring import (
+    DEFAULT_INTERVAL,
+    STATUS_CANCELLED,
+    STATUS_ERROR,
+    STATUS_OK,
+    Monitor,
+    RequestRecord,
+    RequestTracker,
+    SystemSampler,
+)
 from .inference import (
     Engine,
     GenerationParams,
@@ -81,6 +91,8 @@ MEMORY_HINT = (
     "Not enough memory to load the model. Close other applications or "
     "download a smaller model (`make download MODEL=mlx-community/<repo>`)."
 )
+ENDPOINT_CHAT = "/v1/chat/completions"
+ENDPOINT_RESPONSES = "/v1/responses"
 MAX_BACKGROUND_TASKS = 8
 ERROR_TOO_MANY_BACKGROUND = "too_many_background_responses"
 MEMORY_PATTERN = re.compile(
@@ -96,14 +108,25 @@ class GenerationQueue:
     A threading lock (not asyncio.Lock) keeps the queue usable from any event
     loop - TestClient and uvicorn may run requests on different loops, and
     background generations run on their own worker threads.
+
+    An optional tracker only *observes* how many requests wait for the slot;
+    it never changes the locking behaviour.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tracker: RequestTracker | None = None) -> None:
         self._lock = threading.Lock()
+        self._tracker = tracker
 
     @asynccontextmanager
     async def slot(self) -> AsyncIterator[None]:
-        await asyncio.to_thread(self._lock.acquire)
+        tracker = self._tracker
+        if tracker is not None:
+            tracker.begin_wait()
+        try:
+            await asyncio.to_thread(self._lock.acquire)
+        finally:
+            if tracker is not None:
+                tracker.end_wait()
         try:
             yield
         finally:
@@ -112,11 +135,60 @@ class GenerationQueue:
     @contextmanager
     def slot_sync(self) -> Iterator[None]:
         """Blocking variant used by background worker threads."""
-        self._lock.acquire()
+        tracker = self._tracker
+        if tracker is not None:
+            tracker.begin_wait()
+        try:
+            self._lock.acquire()
+        finally:
+            if tracker is not None:
+                tracker.end_wait()
         try:
             yield
         finally:
             self._lock.release()
+
+
+def monitoring_options(engine: Engine) -> tuple[bool, float, bool]:
+    """(periodic monitoring, interval, request stats); never fatal."""
+    try:
+        settings = engine.settings
+    except Exception:
+        logger.debug("monitoring falls back to its defaults", exc_info=True)
+        return True, DEFAULT_INTERVAL, True
+    return (
+        settings.monitoring_enabled,
+        settings.monitoring_interval,
+        settings.request_stats_enabled,
+    )
+
+
+def complete_http_request(record: RequestRecord, response: Any) -> Any:
+    """Finish request stats, deferring streaming/background work to its owner."""
+    if isinstance(response, StreamingResponse):
+        record.defer()
+        return response
+    if record.deferred:
+        return response
+    status = STATUS_OK
+    status_code = getattr(response, "status_code", 200)
+    if isinstance(status_code, int) and status_code >= 400:
+        status = STATUS_ERROR
+    record.finish(status)
+    return response
+
+
+def count_generated_tokens(
+    counter: Callable[[str], int] | None, pieces: list[str]
+) -> int | None:
+    """Fallback token count for engines that report no usage while streaming."""
+    if counter is None or not pieces:
+        return None
+    try:
+        return counter("".join(pieces))
+    except Exception:
+        logger.debug("token counting for the request line failed", exc_info=True)
+        return None
 
 
 def params_for(request: ChatCompletionRequest, settings: Settings) -> GenerationParams:
@@ -232,6 +304,8 @@ async def sse_events(
     tokens: Iterator[TokenChunk],
     model: str,
     queue: GenerationQueue,
+    record: RequestRecord | None = None,
+    counter: Callable[[str], int] | None = None,
 ) -> AsyncIterator[str]:
     """Render token chunks as SSE; a mid-stream failure becomes an error event."""
     chunk_id = f"chatcmpl-{uuid4().hex}"
@@ -239,47 +313,68 @@ async def sse_events(
     usage: UsageOut | None = None
     finish_reason: str | None = None
     failed = False
-    async with queue.slot():
-        yield sse(
-            chunk_payload(chunk_id, created, model, {"role": "assistant"}, None)
-        )
-        try:
-            for token in tokens:
-                if token.usage is not None:
-                    usage = usage_out(token.usage)
-                if token.text:
-                    yield sse(
-                        chunk_payload(
-                            chunk_id, created, model, {"content": token.text}, None
+    outcome = STATUS_CANCELLED
+    pieces: list[str] = []
+    try:
+        async with queue.slot():
+            yield sse(
+                chunk_payload(chunk_id, created, model, {"role": "assistant"}, None)
+            )
+            try:
+                for token in tokens:
+                    if token.usage is not None:
+                        usage = usage_out(token.usage)
+                    if token.text:
+                        if record is not None:
+                            record.mark_first_token()
+                        if counter is not None:
+                            pieces.append(token.text)
+                        yield sse(
+                            chunk_payload(
+                                chunk_id, created, model, {"content": token.text}, None
+                            )
                         )
-                    )
-                if token.finish_reason is not None:
-                    finish_reason = token.finish_reason
-                    yield sse(
-                        chunk_payload(chunk_id, created, model, {}, finish_reason)
-                    )
-                    break
-        except InferenceError as exc:
-            failed = True
-            logger.warning("streaming generation failed: %s", exc)
-            yield sse(
-                error_response(str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED)
-                .model_dump()
+                    if token.finish_reason is not None:
+                        finish_reason = token.finish_reason
+                        yield sse(
+                            chunk_payload(chunk_id, created, model, {}, finish_reason)
+                        )
+                        break
+            except InferenceError as exc:
+                failed = True
+                logger.warning("streaming generation failed: %s", exc)
+                yield sse(
+                    error_response(str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED)
+                    .model_dump()
+                )
+            except Exception:
+                failed = True
+                logger.exception("unexpected streaming failure")
+                yield sse(
+                    error_response(
+                        INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
+                    ).model_dump()
+                )
+            if failed:
+                outcome = STATUS_ERROR
+            else:
+                if finish_reason is None:
+                    yield sse(chunk_payload(chunk_id, created, model, {}, "stop"))
+                if usage is not None:
+                    yield sse(usage_payload(chunk_id, created, model, usage))
+                outcome = STATUS_OK
+            yield sse("[DONE]")
+    except (asyncio.CancelledError, GeneratorExit):
+        outcome = STATUS_CANCELLED
+        raise
+    finally:
+        if record is not None:
+            record.set_output_tokens(
+                usage.completion_tokens
+                if usage is not None
+                else count_generated_tokens(counter, pieces)
             )
-        except Exception:
-            failed = True
-            logger.exception("unexpected streaming failure")
-            yield sse(
-                error_response(
-                    INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
-                ).model_dump()
-            )
-        if not failed:
-            if finish_reason is None:
-                yield sse(chunk_payload(chunk_id, created, model, {}, "stop"))
-            if usage is not None:
-                yield sse(usage_payload(chunk_id, created, model, usage))
-        yield sse("[DONE]")
+            record.finish(outcome)
 
 
 async def stream_response(
@@ -288,6 +383,7 @@ async def stream_response(
     messages: list[dict[str, str]],
     params: GenerationParams,
     queue: GenerationQueue,
+    record: RequestRecord | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Kick off SSE streaming; setup failures come back as JSON errors."""
     try:
@@ -299,7 +395,10 @@ async def stream_response(
     except Exception:
         logger.exception("failed to start streaming generation")
         return error_json(500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE)
-    return StreamingResponse(sse_events(tokens, model, queue), media_type=SSE_MEDIA_TYPE)
+    return StreamingResponse(
+        sse_events(tokens, model, queue, record, engine_token_counter(engine)),
+        media_type=SSE_MEDIA_TYPE,
+    )
 
 
 # ------------------------------------------------------- Responses API (Epic 8)
@@ -533,12 +632,15 @@ def start_background_response(
     created_at: int,
     messages: list[dict[str, Any]],
     params: GenerationParams,
+    record: RequestRecord | None = None,
 ) -> bool:
     """Start a background generation in its own thread.
 
     The worker thread (not the request's event loop) owns the generation, so
     the work survives the request and stays on one thread - which MLX needs.
-    Returns False when the concurrency limit is already reached.
+    The request record is handed over to the worker, which finishes it (and
+    logs the ``[REQ]`` line) once the generation is done. Returns False when
+    the concurrency limit is already reached.
     """
     workers = background_workers(app)
     if len(workers) >= MAX_BACKGROUND_TASKS:
@@ -556,6 +658,7 @@ def start_background_response(
             "created_at": created_at,
             "messages": messages,
             "params": params,
+            "record": record,
         },
     )
     workers.add(worker)
@@ -573,42 +676,54 @@ def run_background_response(
     created_at: int,
     messages: list[dict[str, Any]],
     params: GenerationParams,
+    record: RequestRecord | None = None,
 ) -> None:
     """Generate a background response and store its terminal state."""
     context: list[dict[str, Any]] = []
+    outcome = STATUS_OK
     try:
-        with queue.slot_sync():
-            result = engine.generate(messages, params)
-        response = build_non_streaming_response(
-            engine=engine,
-            request=request,
-            response_id=response_id,
-            created_at=created_at,
-            text=result.text,
-            finish_reason=result.finish_reason,
-            usage=result.usage,
-        )
-        context = follow_up_context(messages, response.output)
-    except UnsupportedToolsError as exc:
-        response = failed_response(
-            request, response_id, created_at, ERROR_UNSUPPORTED_TOOLS, str(exc)
-        )
-    except ModelNotLoadedError as exc:
-        response = failed_response(
-            request, response_id, created_at, ERROR_MODEL_NOT_FOUND, str(exc)
-        )
-    except InferenceError as exc:
-        logger.warning("background generation failed: %s", exc)
-        response = failed_response(
-            request, response_id, created_at, ERROR_GENERATION_FAILED, str(exc)
-        )
-    except Exception:
-        logger.exception("unexpected background generation failure")
-        response = failed_response(
-            request, response_id, created_at, INTERNAL_ERROR_CODE,
-            INTERNAL_ERROR_MESSAGE,
-        )
-    save_stored_response(store, response_id, response, context)
+        try:
+            with queue.slot_sync():
+                result = engine.generate(messages, params)
+            if record is not None:
+                record.set_output_tokens(result.usage.completion_tokens)
+            response = build_non_streaming_response(
+                engine=engine,
+                request=request,
+                response_id=response_id,
+                created_at=created_at,
+                text=result.text,
+                finish_reason=result.finish_reason,
+                usage=result.usage,
+            )
+            context = follow_up_context(messages, response.output)
+        except UnsupportedToolsError as exc:
+            outcome = STATUS_ERROR
+            response = failed_response(
+                request, response_id, created_at, ERROR_UNSUPPORTED_TOOLS, str(exc)
+            )
+        except ModelNotLoadedError as exc:
+            outcome = STATUS_ERROR
+            response = failed_response(
+                request, response_id, created_at, ERROR_MODEL_NOT_FOUND, str(exc)
+            )
+        except InferenceError as exc:
+            outcome = STATUS_ERROR
+            logger.warning("background generation failed: %s", exc)
+            response = failed_response(
+                request, response_id, created_at, ERROR_GENERATION_FAILED, str(exc)
+            )
+        except Exception:
+            outcome = STATUS_ERROR
+            logger.exception("unexpected background generation failure")
+            response = failed_response(
+                request, response_id, created_at, INTERNAL_ERROR_CODE,
+                INTERNAL_ERROR_MESSAGE,
+            )
+        save_stored_response(store, response_id, response, context)
+    finally:
+        if record is not None:
+            record.finish(outcome)
 
 
 async def responses_sse_events(
@@ -619,11 +734,15 @@ async def responses_sse_events(
     store: ResponseStore,
     should_store: bool,
     messages: list[dict[str, Any]],
+    record: RequestRecord | None = None,
+    counter: Callable[[str], int] | None = None,
 ) -> AsyncIterator[str]:
     """Render a Responses API stream; the queue slot is held while generating."""
     usage: Usage | None = None
     finish_reason: str | None = None
     terminal = False
+    outcome = STATUS_CANCELLED
+    pieces: list[str] = []
     try:
         async with queue.slot():
             for event in assembler.created_events():
@@ -633,6 +752,10 @@ async def responses_sse_events(
                     if chunk.usage is not None:
                         usage = chunk.usage
                     if chunk.text:
+                        if record is not None:
+                            record.mark_first_token()
+                        if counter is not None:
+                            pieces.append(chunk.text)
                         for event in assembler.push(chunk.text):
                             yield event.render()
                     if chunk.finish_reason is not None:
@@ -643,11 +766,13 @@ async def responses_sse_events(
                 ):
                     yield event.render()
                 terminal = True
+                outcome = STATUS_OK
             except InferenceError as exc:
                 logger.warning("responses streaming failed: %s", exc)
                 for event in assembler.fail(str(exc), ERROR_GENERATION_FAILED):
                     yield event.render()
                 terminal = True
+                outcome = STATUS_ERROR
             except Exception:
                 logger.exception("unexpected responses streaming failure")
                 for event in assembler.fail(
@@ -655,8 +780,19 @@ async def responses_sse_events(
                 ):
                     yield event.render()
                 terminal = True
+                outcome = STATUS_ERROR
+    except (asyncio.CancelledError, GeneratorExit):
+        outcome = STATUS_CANCELLED
+        raise
     finally:
         close_iterator(tokens)
+        if record is not None:
+            record.set_output_tokens(
+                usage.completion_tokens
+                if usage is not None
+                else count_generated_tokens(counter, pieces)
+            )
+            record.finish(outcome)
         if terminal and should_store:
             save_stored_response(
                 store,
@@ -669,13 +805,34 @@ async def responses_sse_events(
 
 def create_app(engine: Engine | None = None) -> FastAPI:
     """Build the FastAPI app around an (optional) pre-built inference engine."""
+    engine = engine if engine is not None else Engine()
+    monitoring_enabled, monitoring_interval, request_stats = monitoring_options(engine)
+    tracker = RequestTracker(enabled=request_stats)
+    monitor = Monitor(
+        tracker=tracker,
+        interval=monitoring_interval,
+        enabled=monitoring_enabled,
+        sampler=SystemSampler(),
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        monitor.start()
+        try:
+            yield
+        finally:
+            monitor.stop()
+
     app = FastAPI(
         title="local-llm",
         version=__version__,
         description="OpenAI-compatible chat completions served locally via MLX.",
+        lifespan=lifespan,
     )
-    app.state.engine = engine if engine is not None else Engine()
-    app.state.queue = GenerationQueue()
+    app.state.engine = engine
+    app.state.queue = GenerationQueue(tracker)
+    app.state.tracker = tracker
+    app.state.monitor = monitor
 
     @app.exception_handler(RequestValidationError)
     async def _invalid_body(
@@ -690,180 +847,23 @@ def create_app(engine: Engine | None = None) -> FastAPI:
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(request: ChatCompletionRequest) -> Any:
-        engine = app.state.engine
-        if not engine.is_loaded:
-            return model_not_found(request.model)
+        record = app.state.tracker.start(ENDPOINT_CHAT)
         try:
-            params = params_for(request, engine.settings)
-        except SettingsError as exc:
-            return error_json(500, str(exc), SERVER_ERROR, INTERNAL_ERROR_CODE)
-        messages = [
-            {"role": message.role, "content": message.content}
-            for message in request.messages
-        ]
-        if request.stream:
-            return await stream_response(
-                engine, request.model, messages, params, app.state.queue
-            )
-        async with app.state.queue.slot():
-            try:
-                result = await asyncio.to_thread(engine.generate, messages, params)
-            except ModelNotLoadedError:
-                return model_not_found(request.model)
-            except InferenceError as exc:
-                return error_json(500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED)
-            except Exception:
-                logger.exception("generation failed")
-                return error_json(
-                    500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
-                )
-        return completion_response(request.model, result)
+            response = await run_chat_completion(app, request, record)
+        except Exception:
+            record.finish(STATUS_ERROR)
+            raise
+        return complete_http_request(record, response)
 
     @app.post("/v1/responses")
     async def create_response(request: ResponseRequest) -> Any:
-        engine = app.state.engine
-        if not engine.is_loaded:
-            return model_not_found(request.model)
+        record = app.state.tracker.start(ENDPOINT_RESPONSES)
         try:
-            settings = engine.settings
-        except SettingsError as exc:
-            return error_json(500, str(exc), SERVER_ERROR, INTERNAL_ERROR_CODE)
-        store = get_response_store(app, settings)
-
-        previous_context: list[dict[str, Any]] | None = None
-        if request.previous_response_id:
-            record = store.get(request.previous_response_id)
-            if record is None:
-                return response_not_found(request.previous_response_id)
-            if record.status not in (STATUS_COMPLETED, STATUS_INCOMPLETE):
-                return error_json(
-                    400,
-                    f"previous response {request.previous_response_id!r} is not "
-                    f"complete (status: {record.status})",
-                    INVALID_REQUEST,
-                    ERROR_RESPONSE_NOT_FOUND,
-                )
-            previous_context = record.context
-        try:
-            messages = build_messages(request, previous_context)
-        except ResponseRequestError as exc:
-            return error_json(
-                exc.status_code, exc.message, INVALID_REQUEST, exc.code
-            )
-
-        params = responses_params(request, settings)
-        should_store = request.store is not False
-        response_id = new_response_id()
-        created_at = now_timestamp()
-        markers = engine_markers(engine)
-        tool_parser = engine_tool_parser(engine)
-
-        if request.background:
-            initial = build_response_object(
-                request=request,
-                response_id=response_id,
-                created_at=created_at,
-                status=STATUS_IN_PROGRESS,
-            )
-            store.put(
-                response_id,
-                StoredResponse(response=initial.model_dump(), context=[]),
-            )
-            started = start_background_response(
-                app,
-                engine=engine,
-                queue=app.state.queue,
-                store=store,
-                request=request,
-                response_id=response_id,
-                created_at=created_at,
-                messages=messages,
-                params=params,
-            )
-            if not started:
-                store.delete(response_id)
-                return error_json(
-                    429,
-                    f"Too many background responses are already running "
-                    f"(limit: {MAX_BACKGROUND_TASKS}). Retry later.",
-                    "rate_limit_error",
-                    ERROR_TOO_MANY_BACKGROUND,
-                )
-            return JSONResponse(initial.model_dump())
-
-        if request.stream:
-            try:
-                tokens = engine.stream(messages, params)
-            except UnsupportedToolsError as exc:
-                return error_json(
-                    400, str(exc), INVALID_REQUEST, ERROR_UNSUPPORTED_TOOLS
-                )
-            except ModelNotLoadedError:
-                return model_not_found(request.model)
-            except InferenceError as exc:
-                return error_json(
-                    500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED
-                )
-            except Exception:
-                logger.exception("failed to start responses streaming")
-                return error_json(
-                    500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
-                )
-            assembler = ResponseStreamAssembler(
-                request=request,
-                response_id=response_id,
-                created_at=created_at,
-                markers=markers,
-                tool_call_parser=tool_parser,
-                count_tokens=engine_token_counter(engine),
-            )
-            return StreamingResponse(
-                responses_sse_events(
-                    assembler=assembler,
-                    tokens=TokenStream(tokens),
-                    queue=app.state.queue,
-                    store=store,
-                    should_store=should_store,
-                    messages=messages,
-                ),
-                media_type=SSE_MEDIA_TYPE,
-            )
-
-        async with app.state.queue.slot():
-            try:
-                result = await asyncio.to_thread(engine.generate, messages, params)
-            except UnsupportedToolsError as exc:
-                return error_json(
-                    400, str(exc), INVALID_REQUEST, ERROR_UNSUPPORTED_TOOLS
-                )
-            except ModelNotLoadedError:
-                return model_not_found(request.model)
-            except InferenceError as exc:
-                return error_json(
-                    500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED
-                )
-            except Exception:
-                logger.exception("responses generation failed")
-                return error_json(
-                    500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
-                )
-        response = build_non_streaming_response(
-            engine=engine,
-            request=request,
-            response_id=response_id,
-            created_at=created_at,
-            text=result.text,
-            finish_reason=result.finish_reason,
-            usage=result.usage,
-        )
-        if should_store:
-            save_stored_response(
-                store,
-                response_id,
-                response,
-                follow_up_context(messages, response.output),
-            )
-        return JSONResponse(response.model_dump())
+            response = await run_response(app, request, record)
+        except Exception:
+            record.finish(STATUS_ERROR)
+            raise
+        return complete_http_request(record, response)
 
     @app.get("/v1/responses/{response_id}")
     async def get_response(response_id: str) -> Any:
@@ -878,6 +878,193 @@ def create_app(engine: Engine | None = None) -> FastAPI:
         return JSONResponse(record.response)
 
     return app
+
+
+async def run_chat_completion(
+    app: FastAPI, request: ChatCompletionRequest, record: RequestRecord
+) -> Any:
+    """Handle POST /v1/chat/completions (monitoring-agnostic body)."""
+    engine = app.state.engine
+    if not engine.is_loaded:
+        return model_not_found(request.model)
+    try:
+        params = params_for(request, engine.settings)
+    except SettingsError as exc:
+        return error_json(500, str(exc), SERVER_ERROR, INTERNAL_ERROR_CODE)
+    messages = [
+        {"role": message.role, "content": message.content}
+        for message in request.messages
+    ]
+    if request.stream:
+        return await stream_response(
+            engine, request.model, messages, params, app.state.queue, record
+        )
+    async with app.state.queue.slot():
+        try:
+            result = await asyncio.to_thread(engine.generate, messages, params)
+        except ModelNotLoadedError:
+            return model_not_found(request.model)
+        except InferenceError as exc:
+            return error_json(500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED)
+        except Exception:
+            logger.exception("generation failed")
+            return error_json(
+                500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
+            )
+    record.set_output_tokens(result.usage.completion_tokens)
+    return completion_response(request.model, result)
+
+
+async def run_response(
+    app: FastAPI, request: ResponseRequest, record: RequestRecord
+) -> Any:
+    """Handle POST /v1/responses (monitoring-agnostic body)."""
+    engine = app.state.engine
+    if not engine.is_loaded:
+        return model_not_found(request.model)
+    try:
+        settings = engine.settings
+    except SettingsError as exc:
+        return error_json(500, str(exc), SERVER_ERROR, INTERNAL_ERROR_CODE)
+    store = get_response_store(app, settings)
+
+    previous_context: list[dict[str, Any]] | None = None
+    if request.previous_response_id:
+        stored = store.get(request.previous_response_id)
+        if stored is None:
+            return response_not_found(request.previous_response_id)
+        if stored.status not in (STATUS_COMPLETED, STATUS_INCOMPLETE):
+            return error_json(
+                400,
+                f"previous response {request.previous_response_id!r} is not "
+                f"complete (status: {stored.status})",
+                INVALID_REQUEST,
+                ERROR_RESPONSE_NOT_FOUND,
+            )
+        previous_context = stored.context
+    try:
+        messages = build_messages(request, previous_context)
+    except ResponseRequestError as exc:
+        return error_json(exc.status_code, exc.message, INVALID_REQUEST, exc.code)
+
+    params = responses_params(request, settings)
+    should_store = request.store is not False
+    response_id = new_response_id()
+    created_at = now_timestamp()
+    markers = engine_markers(engine)
+    tool_parser = engine_tool_parser(engine)
+
+    if request.background:
+        initial = build_response_object(
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
+            status=STATUS_IN_PROGRESS,
+        )
+        store.put(
+            response_id,
+            StoredResponse(response=initial.model_dump(), context=[]),
+        )
+        started = start_background_response(
+            app,
+            engine=engine,
+            queue=app.state.queue,
+            store=store,
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
+            messages=messages,
+            params=params,
+            record=record,
+        )
+        if not started:
+            store.delete(response_id)
+            return error_json(
+                429,
+                f"Too many background responses are already running "
+                f"(limit: {MAX_BACKGROUND_TASKS}). Retry later.",
+                "rate_limit_error",
+                ERROR_TOO_MANY_BACKGROUND,
+            )
+        record.defer()  # the worker logs the [REQ] line when generation ends
+        return JSONResponse(initial.model_dump())
+
+    if request.stream:
+        try:
+            tokens = engine.stream(messages, params)
+        except UnsupportedToolsError as exc:
+            return error_json(
+                400, str(exc), INVALID_REQUEST, ERROR_UNSUPPORTED_TOOLS
+            )
+        except ModelNotLoadedError:
+            return model_not_found(request.model)
+        except InferenceError as exc:
+            return error_json(
+                500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED
+            )
+        except Exception:
+            logger.exception("failed to start responses streaming")
+            return error_json(
+                500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
+            )
+        assembler = ResponseStreamAssembler(
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
+            markers=markers,
+            tool_call_parser=tool_parser,
+            count_tokens=engine_token_counter(engine),
+        )
+        return StreamingResponse(
+            responses_sse_events(
+                assembler=assembler,
+                tokens=TokenStream(tokens),
+                queue=app.state.queue,
+                store=store,
+                should_store=should_store,
+                messages=messages,
+                record=record,
+                counter=engine_token_counter(engine),
+            ),
+            media_type=SSE_MEDIA_TYPE,
+        )
+
+    async with app.state.queue.slot():
+        try:
+            result = await asyncio.to_thread(engine.generate, messages, params)
+        except UnsupportedToolsError as exc:
+            return error_json(
+                400, str(exc), INVALID_REQUEST, ERROR_UNSUPPORTED_TOOLS
+            )
+        except ModelNotLoadedError:
+            return model_not_found(request.model)
+        except InferenceError as exc:
+            return error_json(
+                500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED
+            )
+        except Exception:
+            logger.exception("responses generation failed")
+            return error_json(
+                500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
+            )
+    record.set_output_tokens(result.usage.completion_tokens)
+    response = build_non_streaming_response(
+        engine=engine,
+        request=request,
+        response_id=response_id,
+        created_at=created_at,
+        text=result.text,
+        finish_reason=result.finish_reason,
+        usage=result.usage,
+    )
+    if should_store:
+        save_stored_response(
+            store,
+            response_id,
+            response,
+            follow_up_context(messages, response.output),
+        )
+    return JSONResponse(response.model_dump())
 
 
 app = create_app()

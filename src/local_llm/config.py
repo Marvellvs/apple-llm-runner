@@ -25,6 +25,9 @@ DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 1.0
 DEFAULT_RESPONSES_STORE_MAX = 100
 DEFAULT_RESPONSES_STORE_TTL = 3600
+DEFAULT_MONITORING_ENABLED = True
+DEFAULT_MONITORING_INTERVAL = 5.0
+DEFAULT_REQUEST_STATS_ENABLED = True
 
 
 class SettingsError(RuntimeError):
@@ -58,6 +61,11 @@ class Settings(BaseSettings):
     responses_store_ttl: int = Field(
         default=DEFAULT_RESPONSES_STORE_TTL, ge=1
     )
+    monitoring_enabled: bool = DEFAULT_MONITORING_ENABLED
+    monitoring_interval: float = Field(
+        default=DEFAULT_MONITORING_INTERVAL, gt=0.0
+    )
+    request_stats_enabled: bool = DEFAULT_REQUEST_STATS_ENABLED
 
     @field_validator("host")
     @classmethod

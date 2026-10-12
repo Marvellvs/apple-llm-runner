@@ -51,7 +51,21 @@ All settings come from environment variables (or a `.env` file in the project ro
 | `LLM_TOP_P` | `1.0` | Top-p (nucleus) sampling (0–1) |
 | `LLM_RESPONSES_STORE_MAX` | `100` | Maximum number of Responses API objects kept in memory (>= 1) |
 | `LLM_RESPONSES_STORE_TTL` | `3600` | Lifetime of a stored response in seconds (>= 1) |
+| `LLM_MONITORING_ENABLED` | `true` | Print the periodic `[MON]` line (CPU/RAM/PROC/Active/Queue) |
+| `LLM_MONITORING_INTERVAL` | `5` | Interval of the `[MON]` line in seconds (> 0) |
+| `LLM_REQUEST_STATS_ENABLED` | `true` | Print one `[REQ]` line (tokens, tok/s, TTFT, total, status) per finished request |
 | `HF_TOKEN` | — (optional) | Hugging Face access token; required only for gated/private models |
+
+**About monitoring:** both lines go through the dedicated `monitoring` logger, so Uvicorn's own
+output and format are untouched. Monitoring only observes: it never changes API responses, SSE
+payloads, the generation queue or the model. It logs no prompts, system prompts, API keys or
+model output, and disabling it (`LLM_MONITORING_ENABLED=false`, `LLM_REQUEST_STATS_ENABLED=false`)
+does not change how requests are served.
+
+```
+[MON] CPU 34% | RAM 18.4/24 GB (77%) | PROC 8.2 GB | Active 1 | Queue 0
+[REQ] POST /v1/responses | 842 tokens | 38.6 tok/s | TTFT 0.42s | Total 22.1s | OK
+```
 
 **About `HF_TOKEN`:**
 
