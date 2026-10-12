@@ -55,10 +55,10 @@ binary: check-venv
 	@$(PYI) packaging/local_llm.spec
 	@echo "binary OK: $(DIST_DIR)/local-llm (run it with --help)"
 
-## binary-dir: build dist/local-llm/ as a directory instead (starts instantly, same files)
+## binary-dir: build dist/local-llm-dir/ as a directory instead (starts instantly, same files)
 binary-dir: check-venv
 	@LLM_ONEFILE=0 $(PYI) packaging/local_llm.spec
-	@echo "binary OK: $(DIST_DIR)/local-llm/local-llm"
+	@echo "binary OK: $(DIST_DIR)/local-llm-dir/local-llm"
 
 ## clean: remove venv, caches and build artifacts
 clean:

@@ -301,7 +301,7 @@ curl http://127.0.0.1:8000/v1/responses \
 | `make delete MODEL=<name>` | Delete a downloaded model |
 | `make run` | Start the server with the model from `LLM_MODEL` |
 | `make binary` | Build `dist/local-llm`, one self-contained executable (no Python install needed) |
-| `make binary-dir` | Build the same bundle as `dist/local-llm/`, a directory that starts without unpacking |
+| `make binary-dir` | Build the same bundle as `dist/local-llm-dir/`, a directory that starts without unpacking |
 | `make test` | Run the test suite |
 | `make coverage` | Run tests with coverage; fails below 80% |
 | `make clean` | Remove `.venv`, caches and build artifacts |
@@ -310,9 +310,9 @@ curl http://127.0.0.1:8000/v1/responses \
 ## Single-file binary
 
 `make binary` packs the CLI, the FastAPI server and every dependency (CPython, MLX,
-MLX Metal kernels, FastAPI, transformers) into one executable at `dist/local-llm`.
-The target Mac needs neither Python nor a virtualenv; it still has to be an Apple
-Silicon Mac running macOS 11+.
+MLX Metal kernels, FastAPI, transformers) into one executable of ≈131 MiB at
+`dist/local-llm`. The target Mac needs neither Python nor a virtualenv; it still
+has to be an Apple Silicon Mac running macOS 11+.
 
 The executable behaves exactly like `python -m local_llm`:
 
@@ -322,16 +322,17 @@ LLM_MODEL=Qwen3-0.6B-MLX-bf16 ./dist/local-llm serve
 ```
 
 Model weights are deliberately *not* embedded - they are 1+ GB each and a
-one-file build unpacks itself on every start. Keep them in `LLM_MODELS_DIR`
+one-file build unpacks itself into a temp folder on every start (≈9 s, against
+≈0.25 s for the directory build). Keep them in `LLM_MODELS_DIR`
 (default `./models`) or download them with the same binary:
 
 ```bash
 ./dist/local-llm download mlx-community/Qwen3-0.6B-MLX-bf16
 ```
 
-`make binary-dir` produces the identical application as a directory; it starts in
-about 0.25 s instead of unpacking several hundred MB into a temp folder, which
-makes it the better choice for repeated local use. See
+`make binary-dir` produces the identical application as `dist/local-llm-dir/`; it
+starts in about 0.25 s instead of unpacking several hundred MB into a temp folder
+on every launch, which makes it the better choice for repeated local use. See
 [packaging/README.md](packaging/README.md) for the build switches (embedding a
 model, custom name, one-dir vs one-file).
 

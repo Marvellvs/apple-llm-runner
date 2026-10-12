@@ -286,10 +286,39 @@ curl http://127.0.0.1:8000/v1/responses \
 | `make list` | Показать скачанные модели с размерами и путями |
 | `make delete MODEL=<name>` | Удалить скачанную модель |
 | `make run` | Запустить сервер с моделью из `LLM_MODEL` |
+| `make binary` | Собрать `dist/local-llm` — один самодостаточный исполняемый файл (Python на целевой машине не нужен) |
+| `make binary-dir` | Собрать то же самое как каталог `dist/local-llm-dir/` — стартует без распаковки |
 | `make test` | Запустить тесты |
 | `make coverage` | Запустить тесты с покрытием; падает ниже 80% |
 | `make clean` | Удалить `.venv`, кэши и артефакты сборки |
 | `make help` | Показать доступные цели |
+
+## Один бинарник
+
+`make binary` упаковывает CLI, FastAPI-сервер и все зависимости (CPython, MLX,
+Metal-ядра MLX, FastAPI, transformers) в один исполняемый файл ≈131 МиБ —
+`dist/local-llm`. На целевой машине нужен только Apple Silicon Mac с macOS 11+:
+ни Python, ни virtualenv.
+
+Бинарник ведёт себя как `python -m local_llm`:
+
+```bash
+./dist/local-llm --help                 # serve / download / list / delete
+LLM_MODEL=Qwen3-0.6B-MLX-bf16 ./dist/local-llm serve
+```
+
+Веса моделей намеренно не встраиваются: каждая весит 1+ ГБ, а однофайловая сборка
+распаковывается во временный каталог при каждом запуске (≈9 с против ≈0.27 с у
+варианта-каталога). Держите их в `LLM_MODELS_DIR` (по умолчанию `./models`) или
+скачайте тем же бинарником:
+
+```bash
+./dist/local-llm download mlx-community/Qwen3-0.6B-MLX-bf16
+```
+
+`make binary-dir` собирает то же приложение каталогом `dist/local-llm-dir/`.
+Переключатели сборки (встраивание модели, своё имя, one-file/one-dir) описаны в
+[packaging/README.md](packaging/README.md).
 
 ## Разработка
 

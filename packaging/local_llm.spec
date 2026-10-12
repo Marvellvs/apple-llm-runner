@@ -181,5 +181,7 @@ else:
         a.datas,
         strip=False,
         upx=False,
-        name=APP_NAME,
+        # Distinct name so `make binary-dir` never overwrites (or is
+        # overwritten by) the one-file build in dist/.
+        name=f"{APP_NAME}-dir",
     )
