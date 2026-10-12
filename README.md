@@ -36,9 +36,60 @@ The server listens on `http://127.0.0.1:8000` by default, loads the model into m
 
 A small dev/smoke model (~1.2 GB): `mlx-community/Qwen3-0.6B-MLX-bf16`.
 
+## Quick start: prebuilt binary
+
+If you have `local-llm` as a single-file build (`make binary`, see
+[Single-file binary](#single-file-binary)), the machine needs neither Python nor
+a virtualenv. Keep the executable, a `.env` file and a `models/` folder in one
+directory and run everything from that directory:
+
+```bash
+# 1. Open Terminal and go to the folder that holds the binary
+cd /path/to/projectfolder
+
+# 2. Create .env there
+cat > .env <<'EOF'
+LLM_MODEL=Qwen3-0.6B-MLX-bf16
+# HF_TOKEN=hf_...    # optional, only for gated/private repositories
+EOF
+
+# 3. Download a model into ./models (the folder after "/" becomes the model name)
+./local-llm download mlx-community/Qwen3-0.6B-MLX-bf16
+
+# 4. Check what is on disk
+./local-llm list
+
+# 5. Start the OpenAI-compatible server
+./local-llm serve
+```
+
+The resulting layout:
+
+```text
+projectfolder/
+├── local-llm                     # the executable
+├── .env                          # LLM_MODEL, LLM_PORT, HF_TOKEN, ...
+└── models/
+    └── Qwen3-0.6B-MLX-bf16/      # downloaded weights
+```
+
+Two rules to remember:
+
+- Settings are resolved against the **current working directory**, not against the
+  executable. `.env` and the default `models/` are looked up in the directory you
+  start the command from, so always `cd` into `projectfolder` first. Launching the
+  binary from elsewhere - or by double-clicking it in Finder - leaves both
+  undiscovered.
+- `LLM_MODEL` must match the folder name that `download` created, i.e. the part
+  after `/` in the repository id (`mlx-community/Qwen3-0.6B-MLX-bf16` →
+  `Qwen3-0.6B-MLX-bf16`).
+
+Exporting the variables (`LLM_MODEL`, `LLM_MODELS_DIR`, `HF_TOKEN`, ...) instead
+of writing `.env` works exactly the same; exported values win over the file.
+
 ## Configuration
 
-All settings come from environment variables (or a `.env` file in the project root — loaded automatically). No config files to edit.
+All settings come from environment variables (or a `.env` file in the current working directory — loaded automatically). No config files to edit.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -312,7 +363,9 @@ curl http://127.0.0.1:8000/v1/responses \
 `make binary` packs the CLI, the FastAPI server and every dependency (CPython, MLX,
 MLX Metal kernels, FastAPI, transformers) into one executable of ≈131 MiB at
 `dist/local-llm`. The target Mac needs neither Python nor a virtualenv; it still
-has to be an Apple Silicon Mac running macOS 11+.
+has to be an Apple Silicon Mac running macOS 11+. For the end-user flow (copy the
+file, create `.env`, download a model, start the server) see
+[Quick start: prebuilt binary](#quick-start-prebuilt-binary).
 
 The executable behaves exactly like `python -m local_llm`:
 
