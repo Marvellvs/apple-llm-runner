@@ -2,10 +2,15 @@ PYTHON   ?= python3
 VENV     := .venv
 VENV_BIN := $(VENV)/bin
 PY       := $(VENV_BIN)/python
+# Build paths are anchored to the project root, not to the current directory.
+DIST_DIR ?= $(CURDIR)/dist
+WORK_DIR ?= $(CURDIR)/build/pyinstaller
+PYI_CACHE := $(CURDIR)/build/pyinstaller-cache
+PYI      := PYINSTALLER_CONFIG_DIR=$(PYI_CACHE) $(VENV_BIN)/pyinstaller --noconfirm --clean --distpath $(DIST_DIR) --workpath $(WORK_DIR)
 
 .DEFAULT_GOAL := help
 
-.PHONY: setup check-venv test coverage download list delete run clean help
+.PHONY: setup check-venv test coverage download list delete run binary binary-dir clean help
 
 ## setup: create .venv (Python >= 3.12) and install the package in editable mode with dev deps
 setup:
@@ -44,6 +49,16 @@ delete: check-venv
 ## run: start the OpenAI-compatible server with the model from LLM_MODEL
 run: check-venv
 	@$(PY) -m local_llm serve
+
+## binary: build dist/local-llm, one self-contained executable (Python + MLX + FastAPI inside)
+binary: check-venv
+	@$(PYI) packaging/local_llm.spec
+	@echo "binary OK: $(DIST_DIR)/local-llm (run it with --help)"
+
+## binary-dir: build dist/local-llm/ as a directory instead (starts instantly, same files)
+binary-dir: check-venv
+	@LLM_ONEFILE=0 $(PYI) packaging/local_llm.spec
+	@echo "binary OK: $(DIST_DIR)/local-llm/local-llm"
 
 ## clean: remove venv, caches and build artifacts
 clean:
