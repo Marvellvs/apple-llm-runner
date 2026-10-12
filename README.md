@@ -2,9 +2,10 @@
 
 Local LLM server for macOS (Apple Silicon) powered by [MLX](https://github.com/ml-explore/mlx) with an OpenAI-compatible API.
 
-Download MLX models from Hugging Face, run them fully on-device, and talk to them through `POST /v1/chat/completions` (including SSE streaming) — no cloud, no API keys of your own to manage.
+Download MLX models from Hugging Face, run them fully on-device, and talk to them through `POST /v1/chat/completions` (including SSE streaming) or `POST /v1/responses` (OpenAI Responses API, including streaming, reasoning, function calling, stored responses and background mode) — no cloud, no API keys of your own to manage.
 
 > Project plan and design notes: [docs/PLAN.md](docs/PLAN.md).
+> Responses API compatibility notes: [docs/RESPONSES_API.md](docs/RESPONSES_API.md).
 
 ## Requirements
 
@@ -48,6 +49,8 @@ All settings come from environment variables (or a `.env` file in the project ro
 | `LLM_MAX_TOKENS` | `512` | Maximum number of tokens to generate |
 | `LLM_TEMPERATURE` | `0.7` | Sampling temperature (0–2) |
 | `LLM_TOP_P` | `1.0` | Top-p (nucleus) sampling (0–1) |
+| `LLM_RESPONSES_STORE_MAX` | `100` | Maximum number of Responses API objects kept in memory (>= 1) |
+| `LLM_RESPONSES_STORE_TTL` | `3600` | Lifetime of a stored response in seconds (>= 1) |
 | `HF_TOKEN` | — (optional) | Hugging Face access token; required only for gated/private models |
 
 **About `HF_TOKEN`:**
@@ -130,9 +133,64 @@ Errors follow the OpenAI envelope: `{"error": {"message", "type", "code"}}`.
 
 | Status | Meaning |
 |---|---|
-| `400` | Invalid request body (validation failed) |
-| `404` | Requested model is not loaded |
+| `400` | Invalid request body (validation failed, unsupported combination, unsupported input item) |
+| `404` | Requested model is not loaded, or a Response id is unknown/expired |
+| `429` | Too many background responses are already running |
 | `500` | Generation failed (server keeps running) |
+
+### `POST /v1/responses`
+
+OpenAI Responses API for AI coding harnesses (opencode, Kilo Code, AI SDK based clients). Same MLX engine, same configuration and the same generation queue as `/v1/chat/completions`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `model` | string | yes | Model name (must be the loaded model) |
+| `input` | string \| array | yes | A user string, or items: `message` (roles `system`/`developer`/`user`/`assistant`), `function_call`, `function_call_output`, `reasoning` |
+| `instructions` | string | no | Prepended as a system instruction (not duplicated when repeated with `previous_response_id`) |
+| `temperature` / `top_p` | number | no | Override `LLM_TEMPERATURE` / `LLM_TOP_P` for this request |
+| `max_output_tokens` | integer | no | Overrides `LLM_MAX_TOKENS`; reaching it ends the response as `incomplete` |
+| `stream` | boolean | no | `true` for typed SSE events (`response.created` … `response.completed` … `data: [DONE]`) |
+| `store` | boolean | no | Default `true`: keep the response retrievable through `GET /v1/responses/{id}` while it fits the in-memory store |
+| `previous_response_id` | string | no | Continue from a stored response; unknown/expired id -> `404` |
+| `tools` / `tool_choice` | array / string | no | Function tools (`{"type":"function","name","description","parameters"}`); only for models whose chat template supports tools |
+| `reasoning` | object | no | `{"effort": "none"}` disables thinking (models/templates that support the keyword); other values are advisory and do not change the prompt |
+| `text` | object | no | Only `{"format": {"type": "text"}}` is supported; other formats return `400` |
+| `background` | boolean | no | Return `in_progress` immediately and finish the generation in the background; poll with `GET`. Cannot be combined with `stream` |
+
+Unknown fields are ignored. Response: a Response object (`id` with the `resp_` prefix, `object: "response"`, `created_at`, `status`, `error`, `incomplete_details`, `model`, `output`, `usage`, `instructions`, `tools`, `tool_choice`, `temperature`, `top_p`, `max_output_tokens`, `background`, `previous_response_id`, `store`). Statuses: `in_progress`, `completed`, `incomplete`, `failed`.
+
+`output` items: `message` (`output_text` content), `reasoning` (summary text, when the model emits its thinking markers) and `function_call` (`call_id`, `name`, `arguments`). Reasoning and function calling are only reported when the model output actually contains them — they are never imitated.
+
+#### Streaming events
+
+With `stream: true` the response is `text/event-stream`; every event carries both an `event:` name and a `type` field, and the stream ends with `data: [DONE]`:
+
+```
+response.created -> response.in_progress
+  message:    response.output_item.added -> response.content_part.added -> response.output_text.delta*
+              -> response.output_text.done -> response.content_part.done -> response.output_item.done
+  reasoning:  response.output_item.added -> response.reasoning_summary_part.added
+              -> response.reasoning_summary_text.delta* -> ...done -> ...part.done -> response.output_item.done
+  function:   response.output_item.added -> response.function_call_arguments.delta
+              -> response.function_call_arguments.done -> response.output_item.done
+response.completed (with usage) | response.incomplete | error
+data: [DONE]
+```
+
+#### Stored responses and background mode
+
+`GET /v1/responses/{response_id}` returns the stored Response object (`404` when unknown or expired). The store is **in-memory only**: it is bounded by `LLM_RESPONSES_STORE_MAX` entries with a `LLM_RESPONSES_STORE_TTL` lifetime, and **history is lost when the server restarts**.
+
+Background generations run on their own worker threads through the same generation queue (at most one generation at a time), and at most 8 background responses may be pending at once — beyond that the request is rejected with `429`.
+
+#### Known limitations
+
+- Function calling requires a model whose tokenizer/template advertises tool support (mlx-lm `has_tool_calling`); otherwise a request with `tools` returns `400` with code `unsupported_tools`.
+- Reasoning is reported only when the loaded model declares thinking markers; `reasoning.effort: "none"` disables thinking, other effort values do not change the prompt.
+- `tools` with images/files in `input` is not supported (text parts only), `text.format` other than `text` is rejected.
+- Usage comes from the engine; `output_tokens_details.reasoning_tokens` is counted locally when the engine exposes a tokenizer.
+
+More details and the verified contract notes: [docs/RESPONSES_API.md](docs/RESPONSES_API.md).
 
 ## curl examples
 
@@ -167,6 +225,57 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 (`-N` disables curl buffering so tokens appear as they are generated.)
+
+Responses API, plain (non-streaming) request:
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B-MLX-bf16",
+    "instructions": "You are a helpful assistant.",
+    "input": "Say hello in one short sentence.",
+    "max_output_tokens": 64
+  }'
+```
+
+Responses API, streaming with a tool definition:
+
+```bash
+curl -N http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B-MLX-bf16",
+    "input": "What is the weather in Paris?",
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    ]
+  }'
+```
+
+Retrieve a stored response (or poll a background one):
+
+```bash
+curl http://127.0.0.1:8000/v1/responses/resp_0123456789abcdef
+```
+
+Start a background generation and poll it:
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "Qwen3-0.6B-MLX-bf16", "input": "Write a haiku.", "background": true }'
+```
 
 ## Make targets
 

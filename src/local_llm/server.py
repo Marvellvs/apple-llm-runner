@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import re
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 from uuid import uuid4
@@ -25,20 +26,48 @@ from .inference import (
     GenerationParams,
     GenerationResult,
     InferenceError,
+    ModelMarkers,
     ModelNotLoadedError,
     TokenChunk,
+    UnsupportedToolsError,
     Usage,
+    default_markers,
+)
+from .responses import (
+    ResponseRequestError,
+    ResponseStreamAssembler,
+    build_messages,
+    build_output_items,
+    build_response_object,
+    count_reasoning_tokens,
+    follow_up_context,
+    new_response_id,
+    now_timestamp,
+    parse_output,
+    responses_usage,
+    sse_done,
 )
 from .schemas import (
     ERROR_GENERATION_FAILED,
     ERROR_INVALID_BODY,
     ERROR_MODEL_NOT_FOUND,
+    ERROR_RESPONSE_NOT_FOUND,
+    ERROR_UNSUPPORTED_TOOLS,
     OBJECT_CHAT_COMPLETION_CHUNK,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_IN_PROGRESS,
+    STATUS_INCOMPLETE,
+    INCOMPLETE_MAX_OUTPUT_TOKENS,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ResponseErrorBody,
+    ResponseObject,
+    ResponseRequest,
     UsageOut,
     error_response,
 )
+from .store import ResponseStore, StoredResponse
 
 logger = logging.getLogger("local_llm.server")
 
@@ -52,6 +81,8 @@ MEMORY_HINT = (
     "Not enough memory to load the model. Close other applications or "
     "download a smaller model (`make download MODEL=mlx-community/<repo>`)."
 )
+MAX_BACKGROUND_TASKS = 8
+ERROR_TOO_MANY_BACKGROUND = "too_many_background_responses"
 MEMORY_PATTERN = re.compile(
     r"\b(?:oom|out of memory|not enough memory|cannot allocate memory|"
     r"can't allocate memory|memory (?:limit|exhausted|allocation failed))\b",
@@ -63,7 +94,8 @@ class GenerationQueue:
     """Serializes model access: one request at a time (MLX unified memory).
 
     A threading lock (not asyncio.Lock) keeps the queue usable from any event
-    loop - TestClient and uvicorn may run requests on different loops.
+    loop - TestClient and uvicorn may run requests on different loops, and
+    background generations run on their own worker threads.
     """
 
     def __init__(self) -> None:
@@ -72,6 +104,15 @@ class GenerationQueue:
     @asynccontextmanager
     async def slot(self) -> AsyncIterator[None]:
         await asyncio.to_thread(self._lock.acquire)
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def slot_sync(self) -> Iterator[None]:
+        """Blocking variant used by background worker threads."""
+        self._lock.acquire()
         try:
             yield
         finally:
@@ -102,7 +143,7 @@ def invalid_body_message(exc: RequestValidationError) -> str:
         location = ".".join(
             str(part) for part in error.get("loc", ()) if part != "body"
         )
-        message = str(error.get("msg", "invalid value"))
+        message = str(error.get("msg", "invalid value")).removeprefix("Value error, ")
         details.append(f"{location}: {message}" if location else message)
     return "Invalid request body: " + "; ".join(details)
 
@@ -261,6 +302,371 @@ async def stream_response(
     return StreamingResponse(sse_events(tokens, model, queue), media_type=SSE_MEDIA_TYPE)
 
 
+# ------------------------------------------------------- Responses API (Epic 8)
+
+BACKGROUND_MESSAGE = (
+    "The response was not completed. Retrieve it with "
+    "GET /v1/responses/{response_id} and check `error`."
+)
+
+
+def response_not_found(response_id: str) -> JSONResponse:
+    """404 for an unknown or expired response id."""
+    return error_json(
+        404,
+        f"Response {response_id!r} was not found. It is unknown or its "
+        "in-memory TTL has expired; in-memory history is lost on restart.",
+        INVALID_REQUEST,
+        ERROR_RESPONSE_NOT_FOUND,
+    )
+
+
+def responses_params(request: ResponseRequest, settings: Settings) -> GenerationParams:
+    """Merge Responses request overrides with the LLM_* defaults."""
+    enable_thinking: bool | None = None
+    if request.reasoning is not None and request.reasoning.effort == "none":
+        enable_thinking = False
+    return GenerationParams(
+        max_tokens=(
+            request.max_output_tokens
+            if request.max_output_tokens is not None
+            else settings.max_tokens
+        ),
+        temperature=(
+            request.temperature
+            if request.temperature is not None
+            else settings.temperature
+        ),
+        top_p=request.top_p if request.top_p is not None else settings.top_p,
+        tools=tuple(request.tools) or None,
+        enable_thinking=enable_thinking,
+    )
+
+
+def get_response_store(app: FastAPI, settings: Settings) -> ResponseStore:
+    """Lazily create the app-wide in-memory response store."""
+    store = getattr(app.state, "response_store", None)
+    if store is None:
+        store = ResponseStore.from_settings(settings)
+        app.state.response_store = store
+    return store
+
+
+def engine_markers(engine: Engine) -> ModelMarkers:
+    """Reasoning/tool markers of the loaded model (engine or defaults)."""
+    return getattr(engine, "markers", None) or default_markers()
+
+
+def engine_tool_parser(engine: Engine) -> Any:
+    return getattr(engine, "tool_call_parser", None)
+
+
+def engine_token_counter(engine: Engine) -> Any:
+    return getattr(engine, "count_tokens", None)
+
+
+class TokenStream:
+    """Bridge between a blocking token iterator and the event loop.
+
+    MLX generation must run on a single thread, so the iterator is consumed on
+    one dedicated worker thread; the event loop only awaits queue reads. The
+    worker can be stopped from any thread through :meth:`close`, and it closes
+    the underlying iterator itself (again on the same thread).
+    """
+
+    def __init__(self, tokens: Iterator[TokenChunk], maxsize: int = 16) -> None:
+        self._tokens = tokens
+        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=maxsize)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="local-llm-token-stream", daemon=True
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        """Ask the worker to stop; safe to call from any thread."""
+        self._stop.set()
+
+    async def __aiter__(self) -> AsyncIterator[TokenChunk]:
+        while True:
+            kind, value = await asyncio.to_thread(self._queue.get)
+            if kind == "end":
+                return
+            if kind == "error":
+                raise value
+            yield value
+
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for the worker thread to finish (used by tests)."""
+        self._thread.join(timeout)
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def _put(self, item: tuple[str, Any]) -> bool:
+        """Enqueue unless a stop was requested in the meantime."""
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self) -> None:
+        try:
+            for chunk in self._tokens:
+                if self._stop.is_set():
+                    break
+                if not self._put(("chunk", chunk)):
+                    break
+        except BaseException as exc:  # surfaced to the consumer as-is
+            self._put(("error", exc))
+        finally:
+            if self._stop.is_set():
+                close_iterator(self._tokens)
+            try:
+                self._queue.put(("end", None), timeout=1.0)
+            except queue.Full:
+                logger.debug("token stream queue stayed full at exit")
+
+
+def close_iterator(tokens: Any) -> None:
+    """Release a token generator (and its queue slot) on early exit."""
+    close = getattr(tokens, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # closing a broken generator is not fatal
+            logger.debug("failed to close the token generator", exc_info=True)
+
+
+def save_stored_response(
+    store: ResponseStore,
+    response_id: str,
+    response: ResponseObject,
+    context: list[dict[str, Any]],
+) -> None:
+    """Persist a Response object plus the context for previous_response_id."""
+    existing = store.get(response_id)
+    store.put(
+        response_id,
+        StoredResponse(
+            response=response.model_dump(),
+            context=context,
+            created=existing.created if existing is not None else 0.0,
+        ),
+    )
+
+
+def build_non_streaming_response(
+    *,
+    engine: Engine,
+    request: ResponseRequest,
+    response_id: str,
+    created_at: int,
+    text: str,
+    finish_reason: str,
+    usage: Usage | None,
+) -> ResponseObject:
+    """Turn a complete generation into a Response object."""
+    output = build_output_items(
+        parse_output(
+            text,
+            markers=engine_markers(engine),
+            enable_tools=bool(request.tools),
+            tool_call_parser=engine_tool_parser(engine),
+        )
+    )
+    status = STATUS_INCOMPLETE if finish_reason == "length" else STATUS_COMPLETED
+    return build_response_object(
+        request=request,
+        response_id=response_id,
+        created_at=created_at,
+        status=status,
+        output=output,
+        usage=responses_usage(
+            usage, count_reasoning_tokens(output, engine_token_counter(engine))
+        ),
+        incomplete_reason=(
+            INCOMPLETE_MAX_OUTPUT_TOKENS if finish_reason == "length" else None
+        ),
+    )
+
+
+def failed_response(
+    request: ResponseRequest,
+    response_id: str,
+    created_at: int,
+    code: str,
+    message: str,
+) -> ResponseObject:
+    """A Response object in the ``failed`` terminal state."""
+    return build_response_object(
+        request=request,
+        response_id=response_id,
+        created_at=created_at,
+        status=STATUS_FAILED,
+        error=ResponseErrorBody(code=code, message=message),
+    )
+
+
+def background_workers(app: FastAPI) -> set[threading.Thread]:
+    """Live background worker threads of this app (finished ones are pruned)."""
+    workers = getattr(app.state, "background_workers", None)
+    if workers is None:
+        workers = set()
+        app.state.background_workers = workers
+    workers.intersection_update(thread for thread in workers if thread.is_alive())
+    return workers
+
+
+def start_background_response(
+    app: FastAPI,
+    *,
+    engine: Engine,
+    queue: GenerationQueue,
+    store: ResponseStore,
+    request: ResponseRequest,
+    response_id: str,
+    created_at: int,
+    messages: list[dict[str, Any]],
+    params: GenerationParams,
+) -> bool:
+    """Start a background generation in its own thread.
+
+    The worker thread (not the request's event loop) owns the generation, so
+    the work survives the request and stays on one thread - which MLX needs.
+    Returns False when the concurrency limit is already reached.
+    """
+    workers = background_workers(app)
+    if len(workers) >= MAX_BACKGROUND_TASKS:
+        return False
+    worker = threading.Thread(
+        target=run_background_response,
+        name="local-llm-background",
+        daemon=True,
+        kwargs={
+            "engine": engine,
+            "queue": queue,
+            "store": store,
+            "request": request,
+            "response_id": response_id,
+            "created_at": created_at,
+            "messages": messages,
+            "params": params,
+        },
+    )
+    workers.add(worker)
+    worker.start()
+    return True
+
+
+def run_background_response(
+    *,
+    engine: Engine,
+    queue: GenerationQueue,
+    store: ResponseStore,
+    request: ResponseRequest,
+    response_id: str,
+    created_at: int,
+    messages: list[dict[str, Any]],
+    params: GenerationParams,
+) -> None:
+    """Generate a background response and store its terminal state."""
+    context: list[dict[str, Any]] = []
+    try:
+        with queue.slot_sync():
+            result = engine.generate(messages, params)
+        response = build_non_streaming_response(
+            engine=engine,
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
+            text=result.text,
+            finish_reason=result.finish_reason,
+            usage=result.usage,
+        )
+        context = follow_up_context(messages, response.output)
+    except UnsupportedToolsError as exc:
+        response = failed_response(
+            request, response_id, created_at, ERROR_UNSUPPORTED_TOOLS, str(exc)
+        )
+    except ModelNotLoadedError as exc:
+        response = failed_response(
+            request, response_id, created_at, ERROR_MODEL_NOT_FOUND, str(exc)
+        )
+    except InferenceError as exc:
+        logger.warning("background generation failed: %s", exc)
+        response = failed_response(
+            request, response_id, created_at, ERROR_GENERATION_FAILED, str(exc)
+        )
+    except Exception:
+        logger.exception("unexpected background generation failure")
+        response = failed_response(
+            request, response_id, created_at, INTERNAL_ERROR_CODE,
+            INTERNAL_ERROR_MESSAGE,
+        )
+    save_stored_response(store, response_id, response, context)
+
+
+async def responses_sse_events(
+    *,
+    assembler: ResponseStreamAssembler,
+    tokens: TokenStream,
+    queue: GenerationQueue,
+    store: ResponseStore,
+    should_store: bool,
+    messages: list[dict[str, Any]],
+) -> AsyncIterator[str]:
+    """Render a Responses API stream; the queue slot is held while generating."""
+    usage: Usage | None = None
+    finish_reason: str | None = None
+    terminal = False
+    try:
+        async with queue.slot():
+            for event in assembler.created_events():
+                yield event.render()
+            try:
+                async for chunk in tokens:
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+                    if chunk.text:
+                        for event in assembler.push(chunk.text):
+                            yield event.render()
+                    if chunk.finish_reason is not None:
+                        finish_reason = chunk.finish_reason
+                        break
+                for event in assembler.finish(
+                    finish_reason=finish_reason, usage=usage
+                ):
+                    yield event.render()
+                terminal = True
+            except InferenceError as exc:
+                logger.warning("responses streaming failed: %s", exc)
+                for event in assembler.fail(str(exc), ERROR_GENERATION_FAILED):
+                    yield event.render()
+                terminal = True
+            except Exception:
+                logger.exception("unexpected responses streaming failure")
+                for event in assembler.fail(
+                    INTERNAL_ERROR_MESSAGE, INTERNAL_ERROR_CODE
+                ):
+                    yield event.render()
+                terminal = True
+    finally:
+        close_iterator(tokens)
+        if terminal and should_store:
+            save_stored_response(
+                store,
+                assembler.response_id,
+                assembler.response,
+                follow_up_context(messages, assembler.output),
+            )
+    yield sse_done()
+
+
 def create_app(engine: Engine | None = None) -> FastAPI:
     """Build the FastAPI app around an (optional) pre-built inference engine."""
     app = FastAPI(
@@ -312,6 +718,164 @@ def create_app(engine: Engine | None = None) -> FastAPI:
                     500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
                 )
         return completion_response(request.model, result)
+
+    @app.post("/v1/responses")
+    async def create_response(request: ResponseRequest) -> Any:
+        engine = app.state.engine
+        if not engine.is_loaded:
+            return model_not_found(request.model)
+        try:
+            settings = engine.settings
+        except SettingsError as exc:
+            return error_json(500, str(exc), SERVER_ERROR, INTERNAL_ERROR_CODE)
+        store = get_response_store(app, settings)
+
+        previous_context: list[dict[str, Any]] | None = None
+        if request.previous_response_id:
+            record = store.get(request.previous_response_id)
+            if record is None:
+                return response_not_found(request.previous_response_id)
+            if record.status not in (STATUS_COMPLETED, STATUS_INCOMPLETE):
+                return error_json(
+                    400,
+                    f"previous response {request.previous_response_id!r} is not "
+                    f"complete (status: {record.status})",
+                    INVALID_REQUEST,
+                    ERROR_RESPONSE_NOT_FOUND,
+                )
+            previous_context = record.context
+        try:
+            messages = build_messages(request, previous_context)
+        except ResponseRequestError as exc:
+            return error_json(
+                exc.status_code, exc.message, INVALID_REQUEST, exc.code
+            )
+
+        params = responses_params(request, settings)
+        should_store = request.store is not False
+        response_id = new_response_id()
+        created_at = now_timestamp()
+        markers = engine_markers(engine)
+        tool_parser = engine_tool_parser(engine)
+
+        if request.background:
+            initial = build_response_object(
+                request=request,
+                response_id=response_id,
+                created_at=created_at,
+                status=STATUS_IN_PROGRESS,
+            )
+            store.put(
+                response_id,
+                StoredResponse(response=initial.model_dump(), context=[]),
+            )
+            started = start_background_response(
+                app,
+                engine=engine,
+                queue=app.state.queue,
+                store=store,
+                request=request,
+                response_id=response_id,
+                created_at=created_at,
+                messages=messages,
+                params=params,
+            )
+            if not started:
+                store.delete(response_id)
+                return error_json(
+                    429,
+                    f"Too many background responses are already running "
+                    f"(limit: {MAX_BACKGROUND_TASKS}). Retry later.",
+                    "rate_limit_error",
+                    ERROR_TOO_MANY_BACKGROUND,
+                )
+            return JSONResponse(initial.model_dump())
+
+        if request.stream:
+            try:
+                tokens = engine.stream(messages, params)
+            except UnsupportedToolsError as exc:
+                return error_json(
+                    400, str(exc), INVALID_REQUEST, ERROR_UNSUPPORTED_TOOLS
+                )
+            except ModelNotLoadedError:
+                return model_not_found(request.model)
+            except InferenceError as exc:
+                return error_json(
+                    500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED
+                )
+            except Exception:
+                logger.exception("failed to start responses streaming")
+                return error_json(
+                    500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
+                )
+            assembler = ResponseStreamAssembler(
+                request=request,
+                response_id=response_id,
+                created_at=created_at,
+                markers=markers,
+                tool_call_parser=tool_parser,
+                count_tokens=engine_token_counter(engine),
+            )
+            return StreamingResponse(
+                responses_sse_events(
+                    assembler=assembler,
+                    tokens=TokenStream(tokens),
+                    queue=app.state.queue,
+                    store=store,
+                    should_store=should_store,
+                    messages=messages,
+                ),
+                media_type=SSE_MEDIA_TYPE,
+            )
+
+        async with app.state.queue.slot():
+            try:
+                result = await asyncio.to_thread(engine.generate, messages, params)
+            except UnsupportedToolsError as exc:
+                return error_json(
+                    400, str(exc), INVALID_REQUEST, ERROR_UNSUPPORTED_TOOLS
+                )
+            except ModelNotLoadedError:
+                return model_not_found(request.model)
+            except InferenceError as exc:
+                return error_json(
+                    500, str(exc), SERVER_ERROR, ERROR_GENERATION_FAILED
+                )
+            except Exception:
+                logger.exception("responses generation failed")
+                return error_json(
+                    500, INTERNAL_ERROR_MESSAGE, SERVER_ERROR, INTERNAL_ERROR_CODE
+                )
+        response = build_non_streaming_response(
+            engine=engine,
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
+            text=result.text,
+            finish_reason=result.finish_reason,
+            usage=result.usage,
+        )
+        if should_store:
+            save_stored_response(
+                store,
+                response_id,
+                response,
+                follow_up_context(messages, response.output),
+            )
+        return JSONResponse(response.model_dump())
+
+    @app.get("/v1/responses/{response_id}")
+    async def get_response(response_id: str) -> Any:
+        engine = app.state.engine
+        try:
+            settings = engine.settings
+        except SettingsError as exc:
+            return error_json(500, str(exc), SERVER_ERROR, INTERNAL_ERROR_CODE)
+        record = get_response_store(app, settings).get(response_id)
+        if record is None:
+            return response_not_found(response_id)
+        return JSONResponse(record.response)
 
     return app
 

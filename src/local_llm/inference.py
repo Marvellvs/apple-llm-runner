@@ -25,6 +25,79 @@ class ModelNotLoadedError(InferenceError):
     """Generation was requested before the model was loaded."""
 
 
+class UnsupportedToolsError(InferenceError):
+    """Tools were requested but the chat template cannot render them."""
+
+
+# Markers used when the tokenizer does not advertise its own. They describe the
+# common Qwen-family layout; every model-specific nuance is overridable via
+# Engine.markers (see markers_for_tokenizer).
+DEFAULT_REASONING_START = "\u003cthink\u003e"
+DEFAULT_REASONING_END = "\u003c/think\u003e"
+DEFAULT_TOOL_CALL_START = "\u003ctool_call\u003e"
+DEFAULT_TOOL_CALL_END = "\u003c/tool_call\u003e"
+
+
+@dataclass(frozen=True)
+class ModelMarkers:
+    """Text markers that separate reasoning / tool calls from plain output."""
+
+    reasoning_start: str | None = None
+    reasoning_end: str | None = None
+    tool_start: str | None = None
+    tool_end: str | None = None
+    structural: tuple[str, ...] = ()
+    introspected: bool = False
+
+    @property
+    def has_reasoning(self) -> bool:
+        return bool(self.reasoning_start and self.reasoning_end)
+
+    @property
+    def has_tools(self) -> bool:
+        return bool(self.tool_start and self.tool_end)
+
+
+def default_markers() -> ModelMarkers:
+    """The documented fallback marker set (used for unrecognised tokenizers)."""
+    return ModelMarkers(
+        reasoning_start=DEFAULT_REASONING_START,
+        reasoning_end=DEFAULT_REASONING_END,
+        tool_start=DEFAULT_TOOL_CALL_START,
+        tool_end=DEFAULT_TOOL_CALL_END,
+    )
+
+
+def markers_for_tokenizer(tokenizer: Any) -> ModelMarkers:
+    """Read the marker metadata an mlx_lm TokenizerWrapper advertises.
+
+    Raw HF tokenizers expose none of these attributes; ``introspected`` stays
+    False and callers may then fall back to :func:`default_markers`.
+    """
+    if tokenizer is None:
+        return ModelMarkers()
+    names = ("has_thinking", "think_start", "tool_call_start", "structural_markers")
+    if not any(hasattr(tokenizer, name) for name in names):
+        return ModelMarkers()
+    reasoning_start = getattr(tokenizer, "think_start", None)
+    reasoning_end = getattr(tokenizer, "think_end", None)
+    tool_start = getattr(tokenizer, "tool_call_start", None)
+    tool_end = getattr(tokenizer, "tool_call_end", None)
+    if not getattr(tokenizer, "has_thinking", False):
+        reasoning_start = reasoning_end = None
+    if not getattr(tokenizer, "has_tool_calling", bool(tool_start)):
+        tool_start = tool_end = None
+    structural = tuple(getattr(tokenizer, "structural_markers", None) or ())
+    return ModelMarkers(
+        reasoning_start=reasoning_start,
+        reasoning_end=reasoning_end,
+        tool_start=tool_start,
+        tool_end=tool_end,
+        structural=structural,
+        introspected=True,
+    )
+
+
 @dataclass(frozen=True)
 class Usage:
     """Token accounting for a prompt/completion pair."""
@@ -44,6 +117,8 @@ class GenerationParams:
     max_tokens: int
     temperature: float
     top_p: float
+    tools: Sequence[Mapping[str, Any]] | None = None
+    enable_thinking: bool | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> GenerationParams:
@@ -107,24 +182,106 @@ def render_messages(messages: Sequence[Message]) -> str:
     return "\n".join(lines)
 
 
+def normalize_tools_for_template(
+    tools: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert tools to the chat-completions shape chat templates expect."""
+    normalized: list[dict[str, Any]] = []
+    for tool in tools:
+        mapping = (
+            tool.model_dump(exclude_none=True)
+            if hasattr(tool, "model_dump")
+            else dict(tool)
+        )
+        if isinstance(mapping.get("function"), dict):
+            normalized.append(mapping)
+            continue
+        function = {
+            key: mapping[key]
+            for key in ("name", "description", "parameters", "strict")
+            if key in mapping
+        }
+        normalized.append({"type": "function", "function": function})
+    return normalized
+
+
 def build_prompt(
-    tokenizer: Any, messages: Sequence[Message]
+    tokenizer: Any,
+    messages: Sequence[Message],
+    tools: Sequence[Mapping[str, Any]] | None = None,
+    enable_thinking: bool | None = None,
 ) -> tuple[str | list[int], int]:
-    """Return the (prompt for mlx_lm, prompt token count) built from messages."""
+    """Return the (prompt for mlx_lm, prompt token count) built from messages.
+
+    When ``tools`` is given they are forwarded to the chat template. Models
+    whose tokenizer does not advertise tool support, and templates that reject
+    the ``tools`` keyword, make this an explicit UnsupportedToolsError instead
+    of silently dropping the tools. ``enable_thinking`` is forwarded when given
+    and silently dropped for templates that do not know the keyword.
+    """
     if not messages:
         raise InferenceError("messages must not be empty")
+    if tools and has_tool_support(tokenizer) is False:
+        raise UnsupportedToolsError(_unsupported_tools_message())
     if has_chat_template(tokenizer):
         rendered = [dict(message) for message in messages]
-        try:
-            prompt = tokenizer.apply_chat_template(
-                rendered, tokenize=True, add_generation_prompt=True
+        kwargs: dict[str, Any] = {}
+        if tools:
+            kwargs["tools"] = normalize_tools_for_template(tools)
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+
+        def render() -> Any:
+            return tokenizer.apply_chat_template(
+                rendered, tokenize=True, add_generation_prompt=True, **kwargs
             )
+
+        try:
+            prompt = render()
+        except TypeError as exc:
+            message = str(exc).lower()
+            if "enable_thinking" in kwargs and "thinking" in message:
+                # the template does not know the keyword; thinking is off anyway
+                kwargs.pop("enable_thinking")
+                try:
+                    prompt = render()
+                except Exception as retry_exc:
+                    raise InferenceError(
+                        f"Failed to apply the chat template: {retry_exc}"
+                    ) from None
+            elif tools and "tool" in message:
+                raise UnsupportedToolsError(_unsupported_tools_message()) from None
+            else:
+                raise InferenceError(
+                    f"Failed to apply the chat template: {exc}"
+                ) from None
         except Exception as exc:
             raise InferenceError(f"Failed to apply the chat template: {exc}") from None
         prompt = list(prompt)
         return prompt, len(prompt)
+    if tools:
+        raise UnsupportedToolsError(_unsupported_tools_message())
     text = render_messages(messages)
     return text, len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def _unsupported_tools_message() -> str:
+    """Explain why function calling is unavailable for the loaded model."""
+    return (
+        "The loaded model does not support tools (its tokenizer/chat template "
+        "cannot render tool calls), so function calling is unavailable. Remove "
+        "'tools' from the request or load a model with tool support."
+    )
+
+
+def has_tool_support(tokenizer: Any) -> bool | None:
+    """True/False when the tokenizer advertises tools, None when unknown."""
+    if tokenizer is None:
+        return None
+    value = getattr(tokenizer, "has_tool_calling", None)
+    if value is None:
+        return None
+    return bool(value)
 
 
 def count_tokens(tokenizer: Any, text: str) -> int:
@@ -175,6 +332,22 @@ class Engine:
     def model_path(self) -> Path | None:
         return self._model_path
 
+    @property
+    def markers(self) -> ModelMarkers:
+        """Reasoning/tool markers of the loaded tokenizer (defaults if unknown)."""
+        markers = markers_for_tokenizer(self._tokenizer)
+        return markers if markers.introspected else default_markers()
+
+    @property
+    def tool_call_parser(self) -> Any:
+        """The mlx_lm per-model tool-call parser, when the tokenizer has one."""
+        return getattr(self._tokenizer, "tool_parser", None)
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in generated text with the loaded tokenizer."""
+        self.ensure_loaded()
+        return count_tokens(self._tokenizer, text)
+
     def load(self) -> Path:
         """Load the weights into memory once; later calls return the path."""
         existing = self._model_path
@@ -211,7 +384,12 @@ class Engine:
         self.ensure_loaded()
         try:
             params = params or GenerationParams.from_settings(self.settings)
-            prompt, prompt_tokens = build_prompt(self._tokenizer, messages)
+            prompt, prompt_tokens = build_prompt(
+                self._tokenizer,
+                messages,
+                tools=params.tools,
+                enable_thinking=params.enable_thinking,
+            )
             sampler = mlx_make_sampler(temp=params.temperature, top_p=params.top_p)
             text = mlx_generate(
                 self._model,
@@ -244,7 +422,12 @@ class Engine:
         self.ensure_loaded()
         try:
             params = params or GenerationParams.from_settings(self.settings)
-            prompt, prompt_tokens = build_prompt(self._tokenizer, messages)
+            prompt, prompt_tokens = build_prompt(
+                self._tokenizer,
+                messages,
+                tools=params.tools,
+                enable_thinking=params.enable_thinking,
+            )
             sampler = mlx_make_sampler(temp=params.temperature, top_p=params.top_p)
         except InferenceError:
             raise

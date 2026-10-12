@@ -2,9 +2,10 @@
 
 Локальный LLM-сервер для macOS (Apple Silicon) на базе [MLX](https://github.com/ml-explore/mlx) с OpenAI-совместимым API.
 
-Скачивайте MLX-модели с Hugging Face, запускайте их полностью на устройстве и общайтесь через `POST /v1/chat/completions` (включая SSE-стриминг) — без облака и без собственных API-ключей.
+Скачивайте MLX-модели с Hugging Face, запускайте их полностью на устройстве и общайтесь через `POST /v1/chat/completions` (включая SSE-стриминг) или `POST /v1/responses` (OpenAI Responses API: стриминг, reasoning, function calling, сохранённые ответы, фон) — без облака и без собственных API-ключей.
 
 > План проекта и заметки по дизайну: [docs/PLAN.md](docs/PLAN.md).
+> Заметки о совместимости Responses API: [docs/RESPONSES_API.md](docs/RESPONSES_API.md).
 
 ## Требования
 
@@ -48,6 +49,8 @@ make run
 | `LLM_MAX_TOKENS` | `512` | Максимальное число генерируемых токенов |
 | `LLM_TEMPERATURE` | `0.7` | Температура сэмплирования (0–2) |
 | `LLM_TOP_P` | `1.0` | Top-p (nucleus) сэмплирование (0–1) |
+| `LLM_RESPONSES_STORE_MAX` | `100` | Максимум объектов Responses API в памяти (>= 1) |
+| `LLM_RESPONSES_STORE_TTL` | `3600` | Время жизни сохранённого ответа, секунды (>= 1) |
 | `HF_TOKEN` | — (опционально) | Токен доступа Hugging Face; нужен только для gated/приватных моделей |
 
 **Про `HF_TOKEN`:**
@@ -130,9 +133,64 @@ OpenAI-совместимые chat completions. Тело запроса:
 
 | Статус | Значение |
 |---|---|
-| `400` | Некорректное тело запроса (провалена валидация) |
-| `404` | Запрошенная модель не загружена |
+| `400` | Некорректное тело запроса (валидация, неподдерживаемая комбинация или элемент `input`) |
+| `404` | Запрошенная модель не загружена, либо id ответа неизвестен/истёк |
+| `429` | Слишком много одновременно выполняющихся фоновых запросов |
 | `500` | Сбой генерации (сервер продолжает работать) |
+
+### `POST /v1/responses`
+
+OpenAI Responses API для AI coding harness (opencode, Kilo Code, клиенты на AI SDK). Тот же MLX-движок, та же конфигурация и та же очередь генерации, что и у `/v1/chat/completions`.
+
+| Поле | Тип | Обязательно | Описание |
+|---|---|---|---|
+| `model` | string | да | Имя модели (должно совпадать с загруженной) |
+| `input` | string \| array | да | Строка пользователя или элементы: `message` (роли `system`/`developer`/`user`/`assistant`), `function_call`, `function_call_output`, `reasoning` |
+| `instructions` | string | нет | Системная инструкция; не дублируется при повторе с `previous_response_id` |
+| `temperature`, `top_p` | number | нет | Переопределяют `LLM_TEMPERATURE` / `LLM_TOP_P` |
+| `max_output_tokens` | integer | нет | Переопределяет `LLM_MAX_TOKENS`; при достижении лимита ответ получает статус `incomplete` |
+| `stream` | boolean | нет | `true` — типизированные SSE-события (`response.created` … `response.completed` … `data: [DONE]`) |
+| `store` | boolean | нет | По умолчанию `true`: ответ доступен через `GET /v1/responses/{id}`, пока помещается в in-memory хранилище |
+| `previous_response_id` | string | нет | Продолжение сохранённого ответа; неизвестный/истёкший id — `404` |
+| `tools`, `tool_choice` | array / string | нет | Function tools; только для моделей, чей chat template поддерживает инструменты |
+| `reasoning` | object | нет | `{"effort": "none"}` отключает thinking (если модель/шаблон понимает этот ключ); остальные значения — справочные и промпт не меняют |
+| `text` | object | нет | Поддерживается только `{"format": {"type": "text"}}`, иначе `400` |
+| `background` | boolean | нет | Сразу вернуть `in_progress` и догенерировать в фоне; нельзя вместе со `stream` |
+
+Неизвестные поля игнорируются. Ответ — Response object: `id` с префиксом `resp_`, `object: "response"`, `created_at`, `status`, `error`, `incomplete_details`, `model`, `output`, `usage`, `instructions`, `tools`, `tool_choice`, `temperature`, `top_p`, `max_output_tokens`, `background`, `previous_response_id`, `store`. Статусы: `in_progress`, `completed`, `incomplete`, `failed`.
+
+Элементы `output`: `message` (контент `output_text`), `reasoning` (summary, если модель реально печатает маркеры мышления) и `function_call` (`call_id`, `name`, `arguments`). Reasoning и вызовы инструментов отдаются только тогда, когда они есть в выводе модели, — они никогда не имитируются.
+
+#### События стриминга
+
+При `stream: true` ответ имеет тип `text/event-stream`; каждое событие несёт и имя `event:`, и поле `type`, поток завершается `data: [DONE]`:
+
+```
+response.created -> response.in_progress
+  message:    output_item.added -> content_part.added -> output_text.delta*
+              -> output_text.done -> content_part.done -> output_item.done
+  reasoning:  output_item.added -> reasoning_summary_part.added
+              -> reasoning_summary_text.delta* -> ...done -> ...part.done -> output_item.done
+  function:   output_item.added -> function_call_arguments.delta
+              -> function_call_arguments.done -> output_item.done
+response.completed (с usage) | response.incomplete | error
+data: [DONE]
+```
+
+#### Сохранённые ответы и фон
+
+`GET /v1/responses/{response_id}` возвращает сохранённый Response object (`404`, если ответ неизвестен или истёк). Хранилище **только в памяти**: ограничено `LLM_RESPONSES_STORE_MAX` записями и временем жизни `LLM_RESPONSES_STORE_TTL`; **после перезапуска сервера история теряется**.
+
+Фоновые генерации выполняются отдельными рабочими потоками через ту же очередь (одновременно идёт не более одной генерации); одновременно незавершённых фоновых ответов — не более 8, дальше запрос отклоняется с `429`.
+
+#### Известные ограничения
+
+- Function calling требует модели, чей токенизатор/шаблон объявляет поддержку инструментов; иначе запрос с `tools` возвращает `400` с кодом `unsupported_tools`.
+- Reasoning выделяется только если модель объявляет маркеры мышления; `reasoning.effort: "none"` отключает thinking, остальные значения промпт не меняют.
+- Только текст: изображения/файлы в `input` не поддерживаются, `text.format` кроме `text` отклоняется.
+- Usage берётся из движка; `output_tokens_details.reasoning_tokens` считается локально, если движок отдаёт токенизатор.
+
+Подробнее: [docs/RESPONSES_API.md](docs/RESPONSES_API.md).
 
 ## Примеры curl
 
@@ -167,6 +225,57 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 (`-N` отключает буферизацию curl, чтобы токены появлялись по мере генерации.)
+
+Responses API, обычный запрос:
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B-MLX-bf16",
+    "instructions": "You are a helpful assistant.",
+    "input": "Say hello in one short sentence.",
+    "max_output_tokens": 64
+  }'
+```
+
+Responses API, стриминг с описанием инструмента:
+
+```bash
+curl -N http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B-MLX-bf16",
+    "input": "What is the weather in Paris?",
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    ]
+  }'
+```
+
+Получить сохранённый ответ (или опросить фоновый):
+
+```bash
+curl http://127.0.0.1:8000/v1/responses/resp_0123456789abcdef
+```
+
+Запустить фоновую генерацию и опросить её:
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "Qwen3-0.6B-MLX-bf16", "input": "Write a haiku.", "background": true }'
+```
 
 ## Make-цели
 

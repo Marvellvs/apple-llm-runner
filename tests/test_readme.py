@@ -23,6 +23,8 @@ ENV_VARS = (
     "LLM_MAX_TOKENS",
     "LLM_TEMPERATURE",
     "LLM_TOP_P",
+    "LLM_RESPONSES_STORE_MAX",
+    "LLM_RESPONSES_STORE_TTL",
     "HF_TOKEN",
 )
 
@@ -141,3 +143,47 @@ def test_readme_mentions_macos_apple_silicon_and_mlx() -> None:
     assert re.search(r"macOS", text)
     assert re.search(r"Apple Silicon", text)
     assert re.search(r"\bMLX\b", text)
+
+
+# ------------------------------------------------- Responses API documentation
+
+
+def test_api_section_documents_the_responses_endpoint() -> None:
+    api = _section(_readme(), "API")
+    assert "/v1/responses" in api
+    assert "previous_response_id" in api
+    assert "background" in api
+    assert "max_output_tokens" in api
+
+
+def test_api_section_documents_responses_store_limited_by_ttl() -> None:
+    api = _section(_readme(), "API")
+    assert re.search(r"in-memory|in memory", api, re.IGNORECASE)
+    assert re.search(r"restart", api, re.IGNORECASE)
+    assert "LLM_RESPONSES_STORE_TTL" in api
+    assert "LLM_RESPONSES_STORE_MAX" in api
+
+
+def test_readme_documents_function_calling_and_reasoning_limits() -> None:
+    api = _section(_readme(), "API")
+    assert re.search(r"function calling", api, re.IGNORECASE)
+    assert re.search(r"reasoning", api, re.IGNORECASE)
+    assert re.search(r"tools", api)
+
+
+def test_readme_contains_responses_curl_examples_after_chat_examples() -> None:
+    blocks = re.findall(r"```bash\s*\n(curl\b.*?)```", _readme(), re.DOTALL)
+    responses = [index for index, block in enumerate(blocks) if "/v1/responses" in block]
+    chats = [
+        index for index, block in enumerate(blocks) if "/v1/chat/completions" in block
+    ]
+    assert responses, "README must include a /v1/responses curl example"
+    assert chats, "README must keep its /v1/chat/completions examples"
+    assert min(responses) > max(chats), (
+        "Responses API examples must come after the chat completions examples"
+    )
+    streaming = [
+        block for block in blocks if "/v1/responses" in block and "stream" in block
+    ]
+    assert streaming, "README must include a streaming /v1/responses example"
+    assert re.search(r"curl -N\b", streaming[0])

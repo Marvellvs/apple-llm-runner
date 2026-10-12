@@ -46,6 +46,8 @@ def test_defaults_apply_when_no_variables_are_set() -> None:
     assert settings.max_tokens == 512
     assert settings.temperature == 0.7
     assert settings.top_p == 1.0
+    assert settings.responses_store_max == 100
+    assert settings.responses_store_ttl == 3600
     assert hf_token_value(settings) is None
 
 
@@ -64,6 +66,8 @@ def test_defaults_apply_when_no_variables_are_set() -> None:
         ("LLM_MAX_TOKENS", "max_tokens", "64", 64),
         ("LLM_TEMPERATURE", "temperature", "0.0", 0.0),
         ("LLM_TOP_P", "top_p", "0.5", 0.5),
+        ("LLM_RESPONSES_STORE_MAX", "responses_store_max", "5", 5),
+        ("LLM_RESPONSES_STORE_TTL", "responses_store_ttl", "60", 60),
     ],
 )
 def test_each_setting_is_overridden_via_env(
@@ -102,6 +106,12 @@ def test_dot_env_file_is_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         ("LLM_TOP_P", "1.5", "top_p"),
         ("LLM_TOP_P", "-0.01", "top_p"),
         ("LLM_MAX_TOKENS", "0", "max_tokens"),
+        ("LLM_RESPONSES_STORE_MAX", "0", "responses_store_max"),
+        ("LLM_RESPONSES_STORE_MAX", "-1", "responses_store_max"),
+        ("LLM_RESPONSES_STORE_MAX", "many", "responses_store_max"),
+        ("LLM_RESPONSES_STORE_TTL", "0", "responses_store_ttl"),
+        ("LLM_RESPONSES_STORE_TTL", "-5", "responses_store_ttl"),
+        ("LLM_RESPONSES_STORE_TTL", "soon", "responses_store_ttl"),
         ("LLM_HOST", "   ", "host"),
     ],
 )

@@ -23,6 +23,8 @@ DEFAULT_MODELS_DIR = "./models"
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 1.0
+DEFAULT_RESPONSES_STORE_MAX = 100
+DEFAULT_RESPONSES_STORE_TTL = 3600
 
 
 class SettingsError(RuntimeError):
@@ -49,6 +51,12 @@ class Settings(BaseSettings):
     top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
     hf_token: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices(TOKEN_ENV)
+    )
+    responses_store_max: int = Field(
+        default=DEFAULT_RESPONSES_STORE_MAX, ge=1
+    )
+    responses_store_ttl: int = Field(
+        default=DEFAULT_RESPONSES_STORE_TTL, ge=1
     )
 
     @field_validator("host")

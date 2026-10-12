@@ -67,13 +67,15 @@ class FakeTokenizer:
         *,
         tokenize: bool = True,
         add_generation_prompt: bool = True,
-        **_: Any,
+        **kwargs: Any,
     ) -> Any:
         self.template_calls.append(
             {
                 "messages": messages,
                 "tokenize": tokenize,
                 "add_generation_prompt": add_generation_prompt,
+                "tools": kwargs.get("tools"),
+                "enable_thinking": kwargs.get("enable_thinking"),
             }
         )
         if self.template_error is not None:
@@ -631,3 +633,236 @@ def test_stream_sampler_failure_is_wrapped(
     engine.load()
     with pytest.raises(InferenceError, match="sampler down"):
         engine.stream(MESSAGES)
+
+
+# ------------------------------------------------- Responses API: tools/markers
+
+
+def test_build_prompt_forwards_tools_in_the_chat_completions_shape() -> None:
+    tokenizer = FakeTokenizer()
+    tools = [
+        {
+            "type": "function",
+            "name": "weather",
+            "description": "d",
+            "parameters": {"type": "object"},
+        }
+    ]
+
+    build_prompt(tokenizer, MESSAGES, tools=tools)
+
+    assert tokenizer.template_calls[-1]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "d",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+
+def test_build_prompt_without_tools_omits_the_kwarg() -> None:
+    tokenizer = FakeTokenizer()
+
+    build_prompt(tokenizer, MESSAGES)
+
+    assert tokenizer.template_calls[-1]["tools"] is None
+
+
+def test_tools_are_rejected_when_the_tokenizer_advertises_no_support() -> None:
+    class NoToolTokenizer(FakeTokenizer):
+        has_tool_calling = False
+
+    with pytest.raises(inference.UnsupportedToolsError, match="tools"):
+        build_prompt(
+            NoToolTokenizer(),
+            MESSAGES,
+            tools=[{"type": "function", "name": "f", "parameters": {}}],
+        )
+
+
+def test_tools_are_rejected_when_the_template_refuses_them() -> None:
+    class StrictTokenizer(FakeTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool = True,
+            **kwargs: Any,
+        ) -> Any:
+            if "tools" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got an unexpected keyword argument 'tools'"
+                )
+            return super().apply_chat_template(
+                messages,
+                tokenize=tokenize,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+    with pytest.raises(inference.UnsupportedToolsError):
+        build_prompt(
+            StrictTokenizer(),
+            MESSAGES,
+            tools=[{"type": "function", "name": "f", "parameters": {}}],
+        )
+
+
+def test_tools_without_a_chat_template_are_rejected() -> None:
+    with pytest.raises(inference.UnsupportedToolsError):
+        build_prompt(
+            FakeTokenizer(chat_template=False),
+            MESSAGES,
+            tools=[{"type": "function", "name": "f", "parameters": {}}],
+        )
+
+
+def test_generate_forwards_tools_from_params(
+    engine: Engine,
+    load_mock: FakeLoad,
+    generate_mock: FakeGenerate,
+    sampler_mock: FakeSamplerFactory,
+    tokenizer: FakeTokenizer,
+) -> None:
+    engine.load()
+    params = GenerationParams(
+        max_tokens=16,
+        temperature=0.0,
+        top_p=1.0,
+        tools=({"type": "function", "name": "f", "parameters": {}},),
+    )
+
+    result = engine.generate(MESSAGES, params)
+
+    assert result.text == "Hello world"
+    assert tokenizer.template_calls[-1]["tools"] == [
+        {"type": "function", "function": {"name": "f", "parameters": {}}}
+    ]
+
+
+def test_stream_forwards_tools_from_params(
+    engine: Engine,
+    load_mock: FakeLoad,
+    stream_mock: FakeStreamGenerate,
+    sampler_mock: FakeSamplerFactory,
+    tokenizer: FakeTokenizer,
+) -> None:
+    engine.load()
+    params = GenerationParams(
+        max_tokens=16,
+        temperature=0.0,
+        top_p=1.0,
+        tools=({"type": "function", "name": "f", "parameters": {}},),
+    )
+
+    list(engine.stream(MESSAGES, params))
+
+    assert tokenizer.template_calls[-1]["tools"] == [
+        {"type": "function", "function": {"name": "f", "parameters": {}}}
+    ]
+
+
+def test_engine_markers_default_for_an_unknown_tokenizer(engine: Engine) -> None:
+    markers = engine.markers
+
+    assert markers.has_reasoning
+    assert markers.has_tools
+
+
+def test_engine_markers_read_the_tokenizer_metadata(engine: Engine) -> None:
+    tokenizer = SimpleNamespace(
+        has_thinking=True,
+        think_start="<T>",
+        think_end="</T>",
+        has_tool_calling=True,
+        tool_call_start="<C>",
+        tool_call_end="</C>",
+        structural_markers=("<S>",),
+    )
+    engine._tokenizer = tokenizer
+
+    markers = engine.markers
+
+    assert markers.reasoning_start == "<T>"
+    assert markers.reasoning_end == "</T>"
+    assert markers.tool_start == "<C>"
+    assert markers.tool_end == "</C>"
+    assert markers.structural == ("<S>",)
+
+
+def test_markers_for_a_tokenizer_without_thinking_or_tools() -> None:
+    tokenizer = SimpleNamespace(
+        has_thinking=False,
+        think_start=None,
+        think_end=None,
+        has_tool_calling=False,
+        tool_call_start=None,
+        tool_call_end=None,
+        structural_markers=(),
+    )
+
+    markers = inference.markers_for_tokenizer(tokenizer)
+
+    assert markers.introspected is True
+    assert markers.has_reasoning is False
+    assert markers.has_tools is False
+
+
+def test_engine_exposes_the_tokenizer_tool_parser(engine: Engine) -> None:
+    parser = lambda body: {"name": "f", "arguments": {}}
+    engine._tokenizer = SimpleNamespace(tool_parser=parser)
+
+    assert engine.tool_call_parser is parser
+
+
+def test_engine_count_tokens_uses_the_tokenizer(
+    engine: Engine, load_mock: FakeLoad, tokenizer: FakeTokenizer
+) -> None:
+    engine.load()
+
+    assert engine.count_tokens("two words") == 2
+    assert tokenizer.encoded_texts[-1] == "two words"
+
+
+def test_engine_count_tokens_requires_a_loaded_model(engine: Engine) -> None:
+    with pytest.raises(ModelNotLoadedError):
+        engine.count_tokens("x")
+
+
+def test_build_prompt_forwards_enable_thinking() -> None:
+    tokenizer = FakeTokenizer()
+
+    build_prompt(tokenizer, MESSAGES, enable_thinking=False)
+
+    assert tokenizer.template_calls[-1]["enable_thinking"] is False
+
+
+def test_enable_thinking_is_dropped_for_templates_that_reject_it() -> None:
+    class NoThinkingTokenizer(FakeTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool = True,
+            **kwargs: Any,
+        ) -> Any:
+            if "enable_thinking" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got an unexpected keyword argument "
+                    "'enable_thinking'"
+                )
+            return super().apply_chat_template(
+                messages,
+                tokenize=tokenize,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+    tokenizer = NoThinkingTokenizer()
+
+    build_prompt(tokenizer, MESSAGES, enable_thinking=False)
+
+    assert tokenizer.template_calls[-1]["enable_thinking"] is None
